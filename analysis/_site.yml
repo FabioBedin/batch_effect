@@ -1,0 +1,17 @@
+name: "batch_effect"
+output_dir: ../docs
+navbar:
+  title: "batch_effect"
+  left:
+  - text: Home
+    href: index.html
+  - text: About
+    href: about.html
+  - text: License
+    href: license.html
+output:
+  workflowr::wflow_html:
+    toc: yes
+    toc_float: yes
+    theme: cosmo
+    highlight: textmate
