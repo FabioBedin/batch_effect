@@ -8,4 +8,32 @@ editor_options:
   chunk_output_type: console
 ---
 
-Welcome to my research website.
+## **Summary**
+
+In questa analisi abbiamo 5 condizioni (samples) numerate da 1 a 5 come segue:
+
+1. solo h2o2 per 1 min non stimolate con EGF
+2. biotin fenolo 30min+ h202 1 min non stimolate con EGF
+3. biotin fenolo 30min+ h202 1 stimolate con EGF per 1 min
+4. biotin fenolo 30min+ h202 1 stimolate con EGF per 2 min
+5. biotin fenolo 30min+ h202 1 stimolate con EGF per 5 min
+
+Ogni condizione è stata ripetuta 5 volte, gli esperimenti sono stati chiamati a, b, c, d, e.
+
+#### **t-test analysis**
+
+Singoli confronti:
+
++ [sample3 vs sample2](sample2_vs_sample3.html)
+
++ [sample4 vs sample2](sample4_vs_sample2.html)
+
++ [sample5 vs sample2](sample5_vs_sample2.html)
+
++ [sample2 vs sample1](sample2_vs_sample1.html)
+
+#### **ANOVA analysis**
+
++ [With all samples](anova_all.html)
+
++ [no h2o2](anova_no_h2o2.html)

@@ -1,0 +1,1135 @@
+---
+title: "LFQ_Analysis"
+author: "Fabio Bedin | MS-Unit at IEO"
+output: html_document
+params:
+  proteinGroups:
+    label: "Input dataset:"
+    value: proteinGroups_exp2.txt
+    input: file
+  expdesign:
+    label: "Experimental design:"
+    value: expdesign_exp2.txt
+    input: file
+  n_peptides: 
+    label: "N° Peptides"
+    value: 2
+    input: select
+    choices: [0, 1, 2, 3]
+  Normalization:
+    label: "Normalization:"
+    value: Max-LFQ
+    input: select
+    choices: [Max-LFQ, VSN, MBQN]
+  test_1:
+    label: "First condition"
+    value: "sample2"
+  test_2: 
+    label: "Second condition"
+    value: "sample1"
+  FDR:
+    label: "FDR"
+    value: 0.05
+    input: select
+    choices: [0.05, 0.01]
+  Fold_change: 
+    label: "Fold Change"
+    value: 1
+    input: slider
+    min: 0
+    max: 2.5
+    step: 0.5
+    sep: ""
+  Imputation: FALSE
+  Cytoscape: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center", warning=FALSE, message=FALSE, fig.height=8, fig.width=10)
+```
+
+```{css fontsize, echo=FALSE}
+p{
+  font-size: 16px;
+}
+```
+
+```{r libreries}
+## Proteomics
+library("MBQN")
+library("DEP")
+library("SummarizedExperiment")
+library("preprocessCore")
+library("enrichR")
+library("gprofiler2")
+library("org.Hs.eg.db")
+library("rrvgo")
+
+## Plots
+library("DT")
+library("patchwork")
+library("datapasta")
+library("ggstatsplot")
+library("UpSetR")
+library("ggrepel")
+library("visdat")
+library("naniar")
+
+## Networks
+library("STRINGdb")
+library("RCy3")
+library("RColorBrewer")
+
+## Other
+library("limma")
+library("here")
+library("openxlsx")
+library("tidyverse")
+```
+
+```{r custom-functions}
+source(here::here("code/custom_functions.R"))
+```
+
+```{r excel-define-wb, include=FALSE}
+header_style <- createStyle(
+  fontSize = 12,
+  fontColour = "#0f0f0f",
+  fgFill = "#faf2ca",
+  halign = "center",
+  border = "TopBottomLeftRight")
+
+body_style <- createStyle(
+  halign = "center",
+  border = "TopBottomLeftRight")
+
+excel <- createWorkbook()
+```
+
+```{r load-PG}
+data <- read.csv(here::here(paste0("data/", params$proteinGroups)), header = TRUE,stringsAsFactors = FALSE, sep = "\t")
+## qui metterei anche Razor...unique.peptides al posto di Peptides, perchè così non conto i peptidi che sono attribuiti a più di 1 PG
+data <- data[data$Reverse != "+" & data$Potential.contaminant != "+" & data$Only.identified.by.site != "+",]
+
+data_unique <- make_unique(data, "Gene.names", "Protein.IDs", delim = ";")
+
+data_unique <- data_unique %>% filter(!name == "S100A7")
+```
+
+```{r expdesig}
+cond_1 <- params$test_1
+
+cond_2 <- params$test_2
+
+conditions<-c(cond_1,cond_2)
+
+test<- paste(cond_1,cond_2,sep="_vs_")
+
+expdesign <- read.table(here::here(paste0("data/", params$expdesign)), header = T, stringsAsFactors = F)
+
+expdesign <- subset(expdesign, condition %in% conditions)
+
+columns<-match(paste("LFQ.intensity.",expdesign$label,sep=""),colnames(data_unique))
+
+data_se <- make_se(data_unique, columns, expdesign)
+
+## define automaticaly the best statistical threshold to filter data besed on replicates:
+# if(max(expdesign$replicate)<=3){
+#        threshold<-0
+#      } else if(max(expdesign$replicate)<6){
+#        threshold<-1
+#      } else if (max(expdesign$replicate)>=6){
+#        threshold<-trunc(max(expdesign$replicate)*0.25) ## 0.25 serve per avere sempre il 75% di valid vales
+#      }
+
+data_filt <- filter_missval(data_se, thr = 1)
+```
+
+
+# **`r cond_1`** vs **`r cond_2`**
+
+***
+
+# **Introduction**
+
+First, we need to wrangling the original dataset. From the **proteinGroups** obtained by [MaxQuant](https://www.maxquant.org/) software, I remove proteins that are marked form the software as potential contaminant, only identify by site and reverse.   
+We che also filter the initial datasets by excluding all proteins identified by less than `r params$n_peptides` peptides.   
+Now, we generate some quality control plots to investigate the structure of the dataset and observe the effect of filters.    
+  
+#### **Normalization strategy:**   
+
+```{r normalization, results = 'asis'}
+if(params$Normalization == "VSN"){
+  data_filt <- normalize_vsn(data_filt)
+  print("VSN normalization is used")
+} else if(params$Normalization == "MBQN"){
+  data_filt <- normalize_MBQN(data_filt)
+  print("MBQN normalization is used")
+} else {
+  print("Max-LFQ normalization is used")
+}
+```
+
+```{r batch-effects}
+# 
+# batch <- c("A", "A", "A", "A", "B", "B", "B", "B")
+# 
+# assay(data_filt) <- limma::removeBatchEffect(assay(data_filt), batch)
+```
+
+## **1. Quality control plots** {.tabset .tabset-fade}
+
+### Proteins per samples {.tabset}
+
+This plot show the number of proteins identify in each samples *after and before User define* filters:
+
+#### Filtered
+
+```{r proteins-filt}
+plot_numbers_lables(data_filt)
+```
+
+#### Not-Filtered
+
+```{r proteins-NOfilt}
+plot_numbers_lables(data_se)
+```
+
+### Distributions {.tabset}
+
+This plot is useful for checking the distributions of the samples *after and before User define* filters:
+
+#### Filtered
+
+```{r normalization-filt}
+plot_normalization(data_filt)
+```
+
+#### Not-Filtered
+
+```{r normalization-NOfilt}
+plot_normalization(data_se)
+```
+
+### Missing data {.tabset}
+
+This plot we can explore the missing data pattern *after and before User define* filters.
+Notice that the percentages of missingness are provided in the data. These are accurate to 1 decimal place.
+Also the dataset is arranged by columns with most missingness.
+
+#### Filtered
+
+```{r missing-data-filt}
+assay(data_filt) %>% 
+  as.data.frame() %>% 
+  vis_miss(., sort_miss = TRUE)
+```
+
+#### Not-Filtered
+
+```{r missing-data-NOfilt}
+assay(data_se) %>% 
+  as.data.frame() %>% 
+  vis_miss(., sort_miss = TRUE)
+```
+
+### Sample CVs {.tabset}
+
+The coefficient of variation (CV) is a statistical measure of the dispersion of data points in a data series around the mean. The coefficient of variation represents the ratio of the standard deviation to the mean, and it is a useful statistic for comparing the degree of variation from one data series to another, even if the means are drastically different from one another.
+
+#### Filtered
+
+```{r CVs-filt}
+plot_cvs(data_filt)
+```
+
+#### Not-Filtered
+
+```{r CVs-NOfilt}
+plot_cvs(data_se)
+```
+
+## **2. Upset plot** {.tabset .tabset-fade}
+
+With this plot we can identify the numper of prteins in common within the 2 conditions or in common between all condition.
+
+### `r cond_1`
+
+```{r upset-cond1, fig.height=12, fig.width=15}
+define_set <- assay(data_filt) %>%  as.data.frame() %>% select(starts_with(cond_1)) %>% colnames()
+n_sets <- length(define_set)
+
+assay(data_filt) %>%
+  as.data.frame() %>%
+  select(starts_with(cond_1)) %>%
+  rownames_to_column() %>%
+  pivot_longer(!rowname, names_to = "samples", values_to = "intensity") %>%
+  mutate(intensity = if_else(is.na(intensity), 0, 1)) %>%
+  pivot_wider(names_from = samples, values_from = intensity) %>%
+  as.data.frame() %>%
+  upset(nsets = n_sets,
+        sets = define_set,
+        order.by = "freq",
+        keep.order = T,
+        text.scale = 2.5,
+        point.size = 4,
+        line.size = 0.5,
+        sets.bar.color = "coral2",
+        main.bar.color  = "gray44")
+```
+
+### `r cond_2`
+
+```{r upset-cond2, fig.height=12, fig.width=15}
+define_set <- assay(data_filt) %>%  as.data.frame() %>% select(starts_with(cond_2)) %>% colnames()
+n_sets <- length(define_set)
+
+assay(data_filt) %>%
+  as.data.frame() %>%
+  select(starts_with(cond_2)) %>%
+  rownames_to_column() %>%
+  pivot_longer(!rowname, names_to = "samples", values_to = "intensity") %>%
+  mutate(intensity = if_else(is.na(intensity), 0, 1)) %>%
+  pivot_wider(names_from = samples, values_from = intensity) %>%
+  as.data.frame() %>%
+  upset(nsets = n_sets,
+        sets = define_set,
+        order.by = "freq",
+        keep.order = T,
+        text.scale = 2.5,
+        point.size = 4,
+        line.size = 0.5,
+        sets.bar.color = "turquoise3",
+        main.bar.color  = "gray44")
+```
+
+### Both conditions
+
+```{r upset-both, fig.height=12, fig.width=15}
+define_set <- assay(data_filt) %>% colnames()
+n_sets <- length(define_set)
+n_each <- n_sets / 2
+
+assay(data_filt) %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  pivot_longer(!rowname, names_to = "samples", values_to = "intensity") %>% 
+  mutate(intensity = if_else(is.na(intensity), 0, 1)) %>% 
+  pivot_wider(names_from = samples, values_from = intensity) %>% 
+  as.data.frame() %>% 
+  upset(nsets = n_sets,
+        sets = define_set,
+        order.by = "freq",
+        keep.order = T,
+        text.scale = 2.5,
+        point.size = 4,
+        line.size = 0.5, 
+        sets.bar.color = rep(c("red3", "royalblue1"), each = n_each),
+        main.bar.color  = "gray44")
+  
+```
+
+## **3. `r if(params$Imputation){"Imputation"}else{"Unique proteins"}`**
+
+`r if(params$Imputation){"An idealized version of a label-free discovery mass spectrometry proteomics experiment would provide absolute abundance measurements for a whole proteome, across varying conditions. Unfortunately, this ideal is not realized. Measurements are made on peptides requiring an inferential step to obtain protein level estimates. The inference is complicated by experimental factors that necessitate relative abundance estimation and result in widespread non-ignorable missing data. Relative abundance on the log scale takes the form of parameter contrasts. In a complete-case analysis, contrast estimates may be biased by missing data and a substantial amount of useful information will often go unused."}else{"This table show unique protein for both conditions"}`
+
+```{r unique-vec, include=FALSE}
+data_filt_unique <- filter_missval(data_se, thr = 1)
+
+uni_name <- unique_pair(data_filt_unique, conditions = conditions, table = T) %>% pull(name)
+```
+
+```{r unique-proteins, eval=!params$Imputation, include=!params$Imputation}
+unique_pair(data_filt_unique, conditions = conditions)
+```
+
+```{r imputation, eval=params$Imputation, include=params$Imputation, results='hide'}
+data_imputed <-mix_imputation_mean(data_filt, cond1 = params$test_1, cond2 = params$test_2)
+
+plot_imputation(data_filt, data_imputed)
+
+data_filt <- data_imputed
+```
+
+```{r complex-heatmap}
+library(devtools)
+# install_github("jokergoo/ComplexHeatmap")
+# mat <- as.matrix(assay(data_filt))
+# mat_z <- scale(mat)
+# 
+# col_split <- c("T0", "T0", "T0", "T0", "T1", "T1", "T1", "T1", "T2", "T2", "T2", "T3", "T3", "T3", "T3")
+# 
+# ComplexHeatmap::Heatmap(mat_z,
+#                         name = "heatmap",
+#                         show_row_names = FALSE,
+#                         column_split = col_split,
+#                         cluster_column_slices = FALSE,
+#                         cluster_row_slices = FALSE,
+#                         use_raster = FALSE)
+```
+
+
+## **4. Differential enrichment analysis** 
+
+Protein-wise linear models combined with empirical Bayes statistics are used for the differential enrichment analysis (or differential expression analysis) and False discovery rate (FDR) is ajusted with *Benjamini-Hochberg* procedure.
+Significant proteins are are define with **FDR = `r params$FDR`** and **Fold change = `r params$Fold_change`**
+
+```{r DEP}
+data_diff <- test_diff_BH(data_filt, type = "manual", test = test)
+
+dep <- add_rejections(data_diff, alpha = params$FDR, lfc = params$Fold_change)
+
+results<-get_results(dep)
+```
+
+There are **`r results %>% filter(significant) %>% nrow()`** significant proteins in **`r cond_1`** vs **`r cond_2`** comparison. 
+
+The results from the previous analysis can be easily visualized by a number of functions. These visualizations assist in the determination of the optimal cutoffs to be used, highlight the most interesting samples and contrasts, and pinpoint differentially enriched/expressed proteins.
+
+### **4.1. Visualization of the results** {.tabset .tabset-fade}
+
+#### PCA
+
+The PCA plot can be used to get a high-level overview of the data. This can be very useful to observe batch effects, such as clear differences between replicates.
+
+```{r PCA}
+if(params$Imputation){
+  if(nrow(dep) >= 500){
+    n_value <- 500
+  }else {
+    n_value <- nrow(dep)
+  }
+  plot_pca(dep, x = 1, y = 2, n = n_value, point_size = 4, indicate = "condition", label = T, label_size = 3)
+} else {
+  var <- apply(assay(dep), 1, sd)
+  df <- assay(dep)[order(var, decreasing = TRUE)[seq_len(nrow(dep))],]
+  n_value <- df %>% as.data.frame() %>% drop_na() %>% nrow()
+  if(n_value >= 500){
+    n_value <- 500
+  }
+  plot_pca(dep, x = 1, y = 2, n = n_value, point_size = 4, indicate = "condition", label = T, label_size = 3)
+}
+```
+
+#### Volcano 
+
+Volcano plots allows to inspect the enrichment of proteins between the two samples (x axis) and their corresponding adjusted p value (y axis).
+
+```{r volcano}
+plot_volcano(dep, contrast=test, add_names=T, label_size=5, adjusted = F)
+```
+
+#### `r if(params$Imputation){"Volcano and unique"}`
+
+```{r volcano-unique, eval=params$Imputation, include=params$Imputation}
+plot_volcano_2(dep, contrast=test, add_names=T, label_size=5, adjusted = F, unique_vec = uni_name)
+```
+
+#### `r if(params$Imputation){"Correlation"}`
+
+```{r correlation-matrix, eval=params$Imputation, include=params$Imputation}
+plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+```
+
+#### `r if(params$Imputation){"Cluster heatmap"}`
+
+`r if(params$Imputation){"The heatmap representation gives an overview of all significant proteins (rows) in all samples (columns). This allows to see general trends, for example if one sample or replicate is really different compared to the others. Additionally, the clustering of samples (columns) can indicate closer related samples and clustering of proteins (rows) indicates similarly behaving proteins."}`
+
+```{r cluster-heatmap, eval=params$Imputation, include=params$Imputation}
+if(results %>% filter(significant) %>% nrow() <= 100){
+  plot_heatmap(dep, type = "centered", kmeans = TRUE, k = 5, show_row_names = T, indicate = "condition", col_limit = 5)
+}else {
+  plot_heatmap(dep, type = "centered", kmeans = TRUE, k = 5, show_row_names = F, indicate = "condition", col_limit = 5)
+}
+```
+
+### **4.2. Result table**
+
+In this table are summarized the results of DEP analysis, sorted by p.value. Proteins that are UP regulated are colored with a red box in Fold change column, in the orhter hand proteins that are DOWN regulated are colored with blue.
+
+```{r res-teble}
+results %>%
+  select(starts_with("name") | starts_with(test)) %>% 
+  filter(across(ends_with("significant"))) %>% 
+  arrange(across(ends_with("p.adj"))) %>%
+  mutate(across(2:3, format, scientific = T, digits = 2)) %>%
+  dplyr::rename_with(~ tolower(gsub(paste0(test,"_"), "", .x)), .cols = starts_with(test)) %>% 
+  mutate(significant = str_to_title(significant)) %>%
+  dplyr::rename(Fold.Change = ratio, Gene.name = name) %>% 
+  DT::datatable(options = list(
+  columnDefs = list(list(className = 'dt-center', targets = 1:5)),
+  pageLength = 10)) %>%
+  formatStyle('Fold.Change', backgroundColor = styleInterval(c(-1, 1), c('lightblue', 'white', 'tomato'))) %>% 
+  formatStyle('significant', color = styleEqual(c("True", "False"), c('green', 'red')))
+```
+
+```{r excel-res-table, eval=!params$Imputation, include=FALSE}
+a <- get_df_wide(dep) %>% 
+  select(c(name, Protein.IDs, Protein.names, starts_with(conditions, ignore.case = FALSE), -ends_with(c("CI.R", "CI.L")))) %>% 
+  dplyr::rename_with(., ~ gsub(pattern = paste0(test, "_"), replacement = "", .), starts_with(test)) %>% 
+  dplyr::rename_with(., ~ gsub(pattern = "^", replacement = "LFQ_intensity_", .), starts_with(conditions)) %>%
+  dplyr::rename(Fold.Change = diff, Gene.name = name) %>% 
+  mutate(significant = if_else(significant, "+", "")) %>% 
+  filter(!is.na(significant)) %>% 
+  mutate(across(c(p.adj, p.val), format, scientific = T, digits = 2)) %>% 
+  mutate(across(starts_with(c("LFQ", "Fold.Change")), .fns = ~ round(.x, digits = 2))) %>% 
+  relocate(significant) %>%
+  relocate(starts_with("LFQ"), .after = p.val) %>% 
+  arrange(desc(significant))
+
+addWorksheet(excel, sheetName = test, gridLines = F)
+
+writeDataTable(excel, sheet = test, x = a, keepNA = T, na.string = "NaN")
+
+n_row <- a %>% nrow() + 1
+
+n_col <- a %>% ncol()
+
+setColWidths(excel, sheet = test, cols = 1:n_col, widths = 21)
+
+addStyle(excel, sheet = test, style = header_style, rows = 1, cols = 1:n_col, gridExpand = T)
+
+addStyle(excel, sheet = test, style = body_style, rows = 2:n_row, cols = 1:n_col, gridExpand = T)
+```
+
+```{r excel-res-table-imp, eval=params$Imputation, include=FALSE}
+a <- get_df_wide(dep) %>%
+  select(c(name, Protein.IDs, Protein.names, imputed, starts_with(conditions, ignore.case = FALSE), -ends_with(c("CI.R", "CI.L")))) %>% 
+  dplyr::rename_with(., ~ gsub(pattern = paste0(test, "_"), replacement = "", .), starts_with(test)) %>% 
+  dplyr::rename_with(., ~ gsub(pattern = "^", replacement = "LFQ_intensity_", .), starts_with(conditions)) %>%
+  dplyr::rename(Fold.Change = diff, Gene.name = name) %>% 
+  mutate(significant = if_else(significant, "+", "")) %>% 
+  filter(!is.na(significant)) %>% 
+  mutate(imputed = if_else(imputed, "+", "")) %>%
+  mutate(across(c(p.adj, p.val), format, scientific = T, digits = 2)) %>% 
+  mutate(across(starts_with(c("LFQ", "Fold.Change")), .fns = ~ round(.x, digits = 2))) %>% 
+  relocate(significant) %>%
+  relocate(starts_with("LFQ"), .after = p.val) %>% 
+  arrange(desc(significant))
+
+addWorksheet(excel, sheetName = test, gridLines = F)
+
+writeDataTable(excel, sheet = test, x = a, keepNA = T, na.string = "NaN")
+
+n_row <- a %>% nrow() + 1
+
+n_col <- a %>% ncol()
+
+setColWidths(excel, sheet = test, cols = 1:n_col, widths = 21)
+
+addStyle(excel, sheet = test, style = header_style, rows = 1, cols = 1:n_col, gridExpand = T)
+
+addStyle(excel, sheet = test, style = body_style, rows = 2:n_row, cols = 1:n_col, gridExpand = T)
+```
+
+```{r excel-unique-table, eval=!params$Imputation, include=FALSE}
+a <- unique_pair(data_filt_unique, conditions = conditions, table = T)
+
+b <- a %>% 
+  pivot_longer(!starts_with(c("name", "unique_", "Protein.", "Peptides")), names_to = "samples", values_to = "intensity") %>% 
+  mutate(cond = gsub(pattern = "..$", "", samples)) %>% 
+  mutate(intensity = case_when(is.na(intensity) ~ 0, TRUE ~ as.numeric(1))) %>%
+  group_by(name, cond) %>% 
+  mutate(Unique_class_B = case_when(sum(intensity) == n_each-1 ~ "+")) %>% 
+  mutate(Unique_class_A = case_when(sum(intensity) == n_each ~ "+")) %>% 
+  ungroup() %>% 
+  select(-cond) %>% 
+  group_by(name) %>% 
+  fill(Unique_class_B, .direction = "downup") %>% 
+  fill(Unique_class_A, .direction = "downup") %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = samples, values_from = intensity) %>% 
+  select(name, starts_with("Peptides."), Unique_class_B, Unique_class_A) %>% 
+  mutate(across(starts_with("Unique_"), ~ case_when(is.na(.x) ~ "", TRUE ~ as.character(.x)))) 
+
+a <- a %>% left_join(b) %>%
+  rename(Gene.name = name)
+
+unique_name <- paste0("Unique_", test)
+
+addWorksheet(excel, sheetName = unique_name, gridLines = F)
+
+writeDataTable(excel, sheet = unique_name, x = a, keepNA = T, na.string = "NaN")
+
+n_row <- a %>% nrow() + 1
+
+n_col <- a %>% ncol()
+
+setColWidths(excel, sheet = unique_name, cols = 1:n_col, widths = 21)
+
+addStyle(excel, sheet = unique_name, style = header_style, rows = 1, cols = 1:n_col, gridExpand = T)
+
+addStyle(excel, sheet = unique_name, style = body_style, rows = 2:n_row, cols = 1:n_col, gridExpand = T)
+```
+
+## **5. Gene Ontology** 
+
+Now I perfom a gene onology analysis (GO or by branch GO:MF, GO:BP, GO:CC) and a KEGG ontology.  
+The enrichment results are visualized with an interactive **Manhattan-like-plot** named "Gostplot".
+
+### **5.1. `r cond_1`** {.tabset .tabset-fade}
+
+#### Gostplot
+
+UP regulated proteins in `r cond_1` were used to generate these gene ontologies.
+`r if(!params$Imputation){"In this case we also use the specific unique genes identify."}`
+
+```{r GO-cond1}
+Gname <- results %>% filter(significant & get(paste0(test, "_ratio")) > 0) %>% pull(name)
+
+if(!params$Imputation){
+  Uni <- unique_pair(data_filt_unique, conditions = conditions, table = T) %>% 
+  filter(!!sym(paste0("unique_", cond_1)) == "+") %>% 
+  pull(name) %>% unique()
+
+  Gname <- c(Gname, Uni)
+}
+
+if(length(Gname) == 0){
+  print("NOT enough data.")
+  GO <- NULL
+}else{
+  GO <- gost(query = Gname, organism = "hsapiens", sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG"), ordered_query = T, evcodes = TRUE)
+  if(is.null(GO)){
+    print("NOT enough data.")
+  }else{
+    gostplot(GO, capped = TRUE, interactive = TRUE)
+  }
+}
+```
+
+#### Table results
+
+The results can also be visualized with a table: 
+
+```{r GO-table-cond1}
+if(is.null(GO)){
+  print("NOT enough data.")
+}else{
+  GO$result %>% 
+    as.data.frame() %>% 
+    select(starts_with(c("source", "term_name", "p_value", "term_size", "intersection_size"))) %>%
+    arrange(p_value) %>%  
+    mutate(p_value = format(p_value, scientific = T, digits = 2)) %>% 
+    DT::datatable(options = list(
+    columnDefs = list(list(className = 'dt-center', targets = 1:6)),
+    pageLength = 10)) %>%
+    formatStyle('source', backgroundColor = styleEqual(c("GO:BP", "GO:MF", "GO:CC", "KEGG"), c('orange', 'tomato', 'lightgreen', 'violet')))
+}
+```
+
+```{r excel-Go-cond1, include=FALSE}
+if(!is.null(GO)){
+  go_excel <- GO$result %>% 
+      as.data.frame() %>% 
+      select(starts_with(c("significant", "source", "term_name", "p_value", "term_size", "intersection_size", "intersection"))) %>%
+      mutate(significant = if_else(significant, "+", "")) %>%
+      arrange(p_value) %>%  
+      mutate(p_value = format(p_value, scientific = T, digits = 2))
+  
+  GO1_name <- paste0("GO_", cond_1)
+  
+  addWorksheet(excel, sheetName = GO1_name, gridLines = F)
+  
+  writeDataTable(excel, sheet = GO1_name, x = go_excel, keepNA = T, na.string = "NaN")
+  
+  n_row <- go_excel %>% nrow() + 1
+  
+  n_col <- go_excel %>% ncol()
+  
+  setColWidths(excel, sheet = GO1_name, cols = 1:(n_col-1), widths = 21)
+  
+  setColWidths(excel, sheet = GO1_name, cols = n_col, widths = "auto")
+  
+  addStyle(excel, sheet = GO1_name, style = header_style, rows = 1, cols = 1:n_col, gridExpand = T)
+  
+  addStyle(excel, sheet = GO1_name, style = body_style, rows = 2:n_row, cols = 1:n_col, gridExpand = T)
+}
+```
+
+#### Treemap {.tabset .tabset-fade}
+
+##### BP
+
+```{r BP-cond1}
+if(sum(GO$result$source == "GO:BP") >= 5 & !is.null(GO)){
+  simMatrix <- GO$result %>% 
+  as.data.frame() %>%
+  filter(source == "GO:BP") %>% 
+  pull(term_id) %>% 
+  calculateSimMatrix(orgdb="org.Hs.eg.db", ont="BP", method="Rel")
+
+scores <- setNames(-log10(GO$result$p_value), GO$result$term_id)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+
+treemapPlot(reducedTerms)
+BP <- T
+}else{
+  print("NOT enough data.")
+  BP <- F
+}
+```
+
+##### MF
+
+```{r MF-cond1}
+if(sum(GO$result$source == "GO:MF") >= 5 & !is.null(GO)){
+simMatrix <- GO$result %>% 
+  as.data.frame() %>%
+  filter(source == "GO:MF") %>% 
+  pull(term_id) %>% 
+  calculateSimMatrix(orgdb="org.Hs.eg.db", ont="MF", method="Rel")
+
+scores <- setNames(-log10(GO$result$p_value), GO$result$term_id)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+
+treemapPlot(reducedTerms)
+MF <- T
+}else{
+  print("NOT enough data.")
+  MF <- F
+}
+```
+
+##### CC
+
+```{r CC-cond1}
+if(sum(GO$result$source == "GO:CC") >= 5 & !is.null(GO)){
+simMatrix <- GO$result %>% 
+  as.data.frame() %>%
+  filter(source == "GO:CC") %>% 
+  pull(term_id) %>% 
+  calculateSimMatrix(orgdb="org.Hs.eg.db", ont="CC", method="Rel")
+
+scores <- setNames(-log10(GO$result$p_value), GO$result$term_id)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+
+treemapPlot(reducedTerms)
+CC <- T
+}else{
+  print("NOT enough data.")
+  CC <- F
+}
+```
+
+#### ScatterPlot
+
+```{r scatter-cond1, fig.height=12, fig.width=15}
+if(BP | MF | CC){
+scatterPlot(simMatrix, reducedTerms, size = "score", labelSize = 5)
+}else{
+  print("NOT enough data.")
+}
+```
+
+### **5.2. `r cond_2`** {.tabset .tabset-fade}
+
+#### Gostplot
+
+UP regulated proteins in `r cond_2` were used to generate these gene ontologies.
+`r if(!params$Imputation){"In this case we also use the specific unique genes identify."}`
+
+```{r GO-cond2}
+Gname <- results %>% filter(significant & get(paste0(test, "_ratio")) < 0) %>% pull(name)
+
+if(!params$Imputation){
+  Uni <- unique_pair(data_filt_unique, conditions = conditions, table = T) %>% 
+  filter(!!sym(paste0("unique_", cond_2)) == "+") %>% 
+  pull(name) %>% unique()
+
+  Gname <- c(Gname, Uni)
+}
+
+if(length(Gname) == 0){
+  print("NOT enough data.")
+  GO <- NULL
+}else{
+  GO <- gost(query = Gname, organism = "hsapiens", sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG"), ordered_query = T, evcodes = TRUE)
+  if(is.null(GO)){
+    print("NOT enough data.")
+  }else{
+    gostplot(GO, capped = TRUE, interactive = TRUE)
+  }
+}
+```
+
+#### Table results
+
+The results can also be visualized with a table: 
+
+```{r GO-table-cond2}
+if(is.null(GO)){
+  print("NOT enough data.")
+}else{
+  GO$result %>% 
+    as.data.frame() %>% 
+    select(starts_with(c("source", "term_name", "p_value", "term_size", "intersection_size"))) %>% 
+    arrange(p_value) %>%  
+    mutate(p_value = format(p_value, scientific = T, digits = 2)) %>% 
+    DT::datatable(options = list(
+    columnDefs = list(list(className = 'dt-center', targets = 1:6)),
+    pageLength = 10)) %>%
+    formatStyle('source', backgroundColor = styleEqual(c("GO:BP", "GO:MF", "GO:CC", "KEGG"), c('orange', 'tomato', 'lightgreen', 'violet')))
+}
+```
+
+```{r excel-Go-cond2, include=FALSE}
+if(!is.null(GO)){
+  go_excel <- GO$result %>% 
+      as.data.frame() %>% 
+      select(starts_with(c("significant", "source", "term_name", "p_value", "term_size", "intersection_size", "intersection"))) %>%
+      mutate(significant = if_else(significant, "+", "")) %>%
+      arrange(p_value) %>%  
+      mutate(p_value = format(p_value, scientific = T, digits = 2))
+  
+  GO2_name <- paste0("GO_", cond_2)
+  
+  addWorksheet(excel, sheetName = GO2_name, gridLines = F)
+  
+  writeDataTable(excel, sheet = GO2_name, x = go_excel, keepNA = T, na.string = "NaN")
+  
+  n_row <- go_excel %>% nrow() + 1
+  
+  n_col <- go_excel %>% ncol()
+  
+  setColWidths(excel, sheet = GO2_name, cols = 1:(n_col-1), widths = 21)
+  
+  setColWidths(excel, sheet = GO2_name, cols = n_col, widths = "auto")
+  
+  addStyle(excel, sheet = GO2_name, style = header_style, rows = 1, cols = 1:n_col, gridExpand = T)
+  
+  addStyle(excel, sheet = GO2_name, style = body_style, rows = 2:n_row, cols = 1:n_col, gridExpand = T)
+}
+```
+
+#### Treemap {.tabset .tabset-fade}
+
+##### BP
+
+```{r BP-cond2}
+if(sum(GO$result$source == "GO:BP") >= 5 & !is.null(GO)){
+  simMatrix <- GO$result %>% 
+  as.data.frame() %>%
+  filter(source == "GO:BP") %>% 
+  pull(term_id) %>% 
+  calculateSimMatrix(orgdb="org.Hs.eg.db", ont="BP", method="Rel")
+
+scores <- setNames(-log10(GO$result$p_value), GO$result$term_id)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+
+treemapPlot(reducedTerms)
+BP <- T
+}else{
+  print("NOT enough data.")
+  BP <- F
+}
+```
+
+##### MF
+
+```{r MF-cond2}
+if(sum(GO$result$source == "GO:MF") >= 5 & !is.null(GO)){
+simMatrix <- GO$result %>% 
+  as.data.frame() %>%
+  filter(source == "GO:MF") %>% 
+  pull(term_id) %>% 
+  calculateSimMatrix(orgdb="org.Hs.eg.db", ont="MF", method="Rel")
+
+scores <- setNames(-log10(GO$result$p_value), GO$result$term_id)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+
+treemapPlot(reducedTerms)
+MF <- T
+}else{
+  print("NOT enough data.")
+  MF <- F
+}
+```
+
+##### CC
+
+```{r CC-cond2}
+if(sum(GO$result$source == "GO:CC") >= 5 & !is.null(GO)){
+simMatrix <- GO$result %>% 
+  as.data.frame() %>%
+  filter(source == "GO:CC") %>% 
+  pull(term_id) %>% 
+  calculateSimMatrix(orgdb="org.Hs.eg.db", ont="CC", method="Rel")
+
+scores <- setNames(-log10(GO$result$p_value), GO$result$term_id)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+
+treemapPlot(reducedTerms)
+CC <- T
+}else{
+  print("NOT enough data.")
+  CC <- F
+}
+```
+
+#### ScatterPlot
+
+```{r scatter-cond2, fig.height=12, fig.width=15}
+if(BP | MF | CC){
+scatterPlot(simMatrix, reducedTerms, size = "score", labelSize = 5)
+}else{
+  print("NOT enough data.")
+}
+```
+
+## **6. Network analysis**
+
+Overview from **STRING Database**:
+In STRING, each protein-protein interaction is annotated with one or more 'scores'.
+Importantly, these scores do **not** indicate the strength or the specificity of the interaction. Instead, they are indicators of **confidence**, i.e. how likely STRING judges an interaction to be true, given the available evidence. All scores rank from 0 to 1, with 1 being the highest possible confidence. A score of 0.5 would indicate that roughly every second interaction might be erroneous (i.e., a false positive).
+
+```{r network-settings, include=FALSE}
+# string_res <- results %>% 
+#   select(starts_with("name") | starts_with(test)) %>% 
+#   filter(across(ends_with("significant"))) %>% 
+#   arrange(across(ends_with("p.adj"))) %>%
+#   dplyr::rename_with(~ tolower(gsub(paste0(test,"_"), "", .x)), .cols = starts_with(test)) %>% 
+#   select(name, p.adj, ratio) %>%
+#   dplyr::rename(Fold.Change = ratio, Gene.name = name)
+# 
+# leng_dep <- nrow(string_res)
+```
+
+
+```{r stringdb, fig.height=15, fig.width=15}
+# if(leng_dep != 0){
+#   
+#   string_db <- STRINGdb$new(version="11.5", species=9606, score_threshold=400)
+# 
+#   string_mapped <- string_db$map(string_res, "Gene.name", removeUnmappedRows = TRUE, quiet = T)
+# 
+#   hits <- string_mapped$STRING_id[1:leng_dep]
+# 
+#   string_db$plot_network(hits, add_link = T)
+# }else{
+#   print("NOT enough data.")
+# }
+```
+
+### **6.1. Cytoscape Network**
+
+Cytoscape is an open source software platform for visualizing complex networks and integrating these with any type of attribute data.
+In this presentation all proteins showing at least one confidence level from the STRING database are shown. The **color** code is relative to **fold change** and the **size** is directly proportional to the **significance (p-value)**.
+
+```{r cytoscape-of-message1, eval=!params$Cytoscape}
+print("Enable Cytoscape option to see this results.")
+```
+
+```{r cytoscape, eval=params$Cytoscape, results='hide', include=FALSE}
+if(leng_dep != 0){
+  ## load DEP in STRING database and load the network in Cytoscape:
+  
+  string_cmd <- paste('string protein query taxonID=9606 limit=0 cutoff=0.4 query="', paste(string_res$Gene.name, collapse=","),'"',sep="")
+  
+  commandsGET(string_cmd)
+  
+  n_edge <- getTableColumns("edge") %>% nrow()
+  
+  if(n_edge != 0){
+  
+    ## Add FC and pvalue information to the network
+    
+    loadTableData(string_res, table.key.column = "display name", data.key.column = "Gene.name")
+    
+    ## layout settings: (per vedere i layout disponibili: getLayoutNames())
+    
+    layoutNetwork('force-directed') ## per vedere le impostazioni: getLayoutPropertyNames('force-directed')
+    
+    ## style settings:
+    
+    style_name = "Style_FC_pval"
+    
+    defaults_list <- list(NODE_SHAPE="ellipse",
+                     EDGE_TRANSPARENCY=120)
+    
+    node_label_map <- mapVisualProperty('node label','display name','p') ## p for passthrough; nothing else needed
+    
+    createVisualStyle(style_name, defaults_list, list(node_label_map))
+    
+    setVisualStyle(style.name=style_name)
+    
+    min_logfc = min(string_res$Fold.Change, na.rm=TRUE)
+    
+    max_logfc = max(string_res$Fold.Change, na.rm=TRUE)
+    
+    data_values = c(min_logfc, 0, max_logfc)
+    
+    #display.brewer.all(length(data_values), colorblindFriendly=TRUE, type="div")
+    
+    node_colors <- c(rev(brewer.pal(length(data_values), "RdBu")))
+    
+    setNodeColorMapping("Fold.Change", data_values, node_colors, style.name=style_name)
+    
+    setNodeSizeMapping(table.column = 'p.adj', 
+                       table.column.values = c(min(string_res$p.adj), 
+                                               mean(string_res$p.adj), 
+                                               max(string_res$p.adj)), 
+                       sizes = c(150, 60, 30),
+                       mapping.type = "c", 
+                       style.name = style_name)
+    
+    setNodeFontSizeDefault(25, style.name = style_name)
+    
+    createDegreeFilter('degree filter', c(0,0), 'IS_NOT_BETWEEN') # fare altra immagine con filtro a 2
+    
+    createSubnetwork(subnetwork.name ='FC_pval: no single nodes')
+    
+    fitContent()
+    
+    ## export network image:
+    
+    if(file.exists(here::here("output/network_FC_pvalue.png"))){
+      file.remove(here::here("output/network_FC_pvalue.png"))
+      } 
+    
+    exportImage(filename = here::here("output/network_FC_pvalue.png"), 'PNG', zoom=300)
+    
+    file.copy(from = here::here("output/network_FC_pvalue.png"), to = here::here("docs/assets/network_FC_pvalue.png"), overwrite = T)
+  }else{
+  print("NOT enough data.")
+  }
+
+}else{
+  print("NOT enough data.")
+  n_edge <- 0
+}
+``` 
+
+```{r image-cytoscape, eval=params$Cytoscape, out.height= "150%", out.width= "150%"}
+if(n_edge != 0){
+  knitr::include_graphics("assets/network_FC_pvalue.png",  error = F)
+}else{
+  print("NOT enough data.")
+}
+```
+
+### **6.2. Cytoscape EnrichmentMap**
+
+An **enrichment map** is a different sort of network. Instead of nodes representing genes, nodes represent pathways or functions. Edges between these pathways or functions represent shared genes or pathway crosstalk. An enrichment map is a way to visualize your enrichment results to help reduce redundancy and uncover main themes.
+
+```{r cytoscape-of-message2, eval=!params$Cytoscape}
+print("Enable Cytoscape option to see this results.")
+```
+
+```{r GO-enrichment-map, eval=params$Cytoscape}
+Gname <- results %>% filter(significant) %>% pull(name)
+
+if(!params$Imputation){
+  
+  Uni <- unique_pair(data_filt_unique, conditions = conditions, table = T) %>% 
+  pull(name) %>% 
+  unique()
+
+  Gname <- c(Gname, Uni)
+}
+
+if(length(Gname) == 0){
+  
+  print("NOT enough data.")
+  
+}else{
+  
+  GO <- gost(query = Gname, organism = "hsapiens", sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG"), ordered_query = T, evcodes = TRUE)
+  
+  if(is.null(GO)){
+    
+    print("NOT enough data.")
+
+    enrich_map = F
+    
+  }else{
+    
+    enrich_map = T
+    
+    gem <- GO$result[,c("term_id", "term_name", "p_value", "intersection")]
+    colnames(gem) <- c("GO.ID", "Description", "p.Val", "Genes")
+    gem$FDR <- gem$p.Val
+    gem$Phenotype = "+1"
+    gem <- gem[,c("GO.ID", "Description", "p.Val", "FDR", "Phenotype", "Genes")]
+    head(gem)
+  
+    write.table(gem, here::here("output/enrichmentmap.txt"),col.name=TRUE,sep="\t",row.names=FALSE,quote=FALSE)
+    
+  }
+}
+```
+
+```{r enrichment-map, eval=params$Cytoscape, include=FALSE}
+if(enrich_map){
+  em_command = paste('enrichmentmap build analysisType="generic" ',
+                   'pvalue=',"0.05", 'qvalue=',"0.05",
+                   'similaritycutoff=',"0.25",
+                   'coefficients=',"JACCARD",
+                   'enrichmentsDataset1=', here::here("output/enrichmentmap.txt"),
+                   sep=" ")
+
+  commandsGET(em_command)
+
+  # Run the AutoAnnotate command
+  aa_command <- paste("autoannotate annotate-clusterBoosted",
+                        "clusterAlgorithm=MCL",
+                        "labelColumn=EnrichmentMap::GS_DESCR",
+                        "maxWords=3")
+
+  commandsGET(aa_command)
+
+  layoutNetwork('force-directed')
+
+  layoutNetwork('force-directed')
+
+  if(file.exists(here::here("output/network_enrichmentmap.png"))){
+      file.remove(here::here("output/network_enrichmentmap.png"))
+      }
+
+  exportImage(filename = here::here("output/network_enrichmentmap.png"), 'PNG', zoom=300)
+
+  file.copy(from = here::here("output/network_enrichmentmap.png"), to = here::here("docs/assets/network_enrichmentmap.png"), overwrite = T)
+
+}else{
+  print("NOT enough data.")
+}
+
+```
+
+```{r image-cytoscape-emap, eval=params$Cytoscape, out.height= "150%", out.width= "150%"}
+if(enrich_map){
+  knitr::include_graphics("assets/network_enrichmentmap.png",  error = F)
+}else{
+  print("NOT enough data.")
+}
+```
+
+## {-}
+
+```{r excel}
+saveWorkbook(excel, here::here(paste0("output/results_table_", test, ".xlsx")), overwrite = T)
+```
